@@ -1,0 +1,1643 @@
+package com.example.woodrower.bluetooth
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.Application
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothGattService
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import androidx.compose.runtime.mutableStateOf
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import java.io.File
+
+object RowingBluetoothUUIDs {
+    // Standard FTMS (Fitness Machine Service) - used by Domyos-ROW-0658
+    val SERVICE_FTMS = "00001826-0000-1000-8000-00805f9b34fb"
+    val CHAR_ROWER_DATA = "00002AD1-0000-1000-8000-00805f9b34fb"  // Rower Data
+    val CHAR_FITNESS_MACHINE_CONTROL_POINT = "00002AD9-0000-1000-8000-00805f9b34fb"
+    val CHAR_SUPPORTED_RESISTANCE_RANGE = "00002AD6-0000-1000-8000-00805f9b34fb"  // Supported Resistance Range
+
+    // Legacy UUIDs for other fitness equipment (fallbacks)
+    val CHAR_TREADMILL = "00002ACD-0000-1000-8000-00805f9b34fb"
+    val CHAR_INDOOR_BIKE = "00002AD2-0000-1000-8000-00805f9b34fb"
+
+    // Legacy custom UUIDs (Nordic) - for reference
+    val SERVICE_DOMYOS_CUSTOM = "0000fff0-0000-1000-8000-00805f9b34fb"
+    val CHAR_DOMYOS_CUSTOM = "0000fff6-0000-1000-8000-00805f9b34fb"
+
+    val DESC_NOTIFY = "00002902-0000-1000-8000-00805f9b34fb"
+}
+
+@Serializable
+data class RowingData(
+    val totalDistance: Float = 0f,
+    val speed: Float = 0f,
+    val averageSpeed: Float = 0f,
+    val calories: Int = 0,
+    val time: Int = 0,
+    val resistanceLevel: Int = 0,  // Current resistance level (1-15)
+    val cadence: Float = 0f,      // Instantaneous Strokes per minute
+    val averageCadence: Float = 0f,  // Average Strokes per minute
+    val power: Int = 0,           // Instantaneous Power in Watts
+    val totalStrokes: Int = 0,    // Total number of strokes
+    val timestamp: Long = System.currentTimeMillis()
+) {
+    // Helper to calculate calories from distance (estimate for rowing)
+    // ~0.12 calories per meter for average person
+    fun withCalories(): RowingData {
+        return this.copy(calories = (totalDistance * 0.12f).toInt())
+    }
+}
+
+@Serializable
+data class CorrectedReading(
+    val deviceData: RowingData,
+    val manualPace: Float?,       // m/s
+    val manualCadence: Float?,    // spm
+    val manualStrokes: Int?,      // count
+    val manualEnergy: Int?,       // kCal
+    val manualDistance: Float?,  // meters
+    val timestamp: Long = System.currentTimeMillis()
+) {
+    // Get corrected values, using device data if manual is null
+    val correctedPace: Float get() = manualPace ?: deviceData.speed
+    val correctedCadence: Float get() = manualCadence ?: deviceData.cadence
+    val correctedStrokes: Int get() = manualStrokes ?: deviceData.totalStrokes
+    val correctedEnergy: Int get() = manualEnergy ?: deviceData.calories
+    val correctedDistance: Float get() = manualDistance ?: deviceData.totalDistance
+}
+
+class RowingBluetoothManager(private val context: Context) {
+    @Suppress("DEPRECATION")
+    private val adapter by lazy { android.bluetooth.BluetoothAdapter.getDefaultAdapter() }
+    private var gatt: BluetoothGatt? = null
+    private var scanCallback: ScanCallback? = null
+    private val handler = Handler(Looper.getMainLooper())
+    private var timer: java.util.Timer? = null
+    private var autoScanTimer: java.util.Timer? = null
+    private var startTime: Long = 0
+    private var deviceStarted = false
+    private var autoScanEnabled = false
+    private var lastDataUpdateTime: Long = 0  // Track when we last received data
+
+    val isScanning = mutableStateOf(false)
+    val isConnected = mutableStateOf(false)
+    val isAutoScanning = mutableStateOf(false)
+    val status = mutableStateOf("Disconnected")
+    val devices = mutableStateOf<List<BluetoothDevice>>(emptyList())
+    val data = mutableStateOf(RowingData())
+    val history = mutableStateOf<List<RowingData>>(emptyList())
+    val correctedReadings = mutableStateOf<List<CorrectedReading>>(emptyList())
+    val resistanceScheduleState = mutableStateOf<List<Pair<Int, Int>>>(emptyList())
+    val lastResistanceChangeTime = mutableStateOf<Long>(0)  // Timestamp of last resistance change
+    val currentResistance = mutableStateOf<Int>(0)  // Current resistance level from device (1-15)
+    val resistanceMin = mutableStateOf<Int>(1)  // Minimum resistance level from device
+    val resistanceMax = mutableStateOf<Int>(15)  // Maximum resistance level from device
+    val sessionStartTime = mutableStateOf<Long>(0)  // Session start timestamp
+
+    // Track speeds for average calculation (last 10s)
+    private val speedReadings = mutableListOf<Pair<Long, Float>>()  // (timestamp, speed)
+
+    companion object {
+        private const val TAG = "RowingBT"
+        private const val TARGET_NAME = "Domyos-ROW-0658"
+    }
+
+    // Public function to reset session data
+    fun resetSession() {
+        speedReadings.clear()
+        data.value = RowingData()
+        history.value = emptyList()
+        currentResistance.value = 0
+        startTime = System.currentTimeMillis()
+        sessionStartTime.value = startTime
+        deviceStarted = false
+        lastDataUpdateTime = 0  // Reset data update tracker
+    }
+
+    // Save current device reading with manual corrections
+    fun saveCorrectedReading(
+        manualPace: Float? = null,
+        manualCadence: Float? = null,
+        manualStrokes: Int? = null,
+        manualEnergy: Int? = null,
+        manualDistance: Float? = null
+    ) {
+        val currentData = data.value
+        val corrected = CorrectedReading(
+            deviceData = currentData,
+            manualPace = manualPace,
+            manualCadence = manualCadence,
+            manualStrokes = manualStrokes,
+            manualEnergy = manualEnergy,
+            manualDistance = manualDistance,
+            timestamp = System.currentTimeMillis()
+        )
+        correctedReadings.value = correctedReadings.value + corrected
+        Log.d(
+            TAG, "Saved corrected reading: deviceDistance=${currentData.totalDistance}m, " +
+                    "manualDistance=${manualDistance}, devicePace=${currentData.speed}m/s, " +
+                    "manualPace=${manualPace}"
+        )
+    }
+
+    // Clear all saved corrected readings
+    fun clearCorrectedReadings() {
+        correctedReadings.value = emptyList()
+    }
+
+    // Save corrected readings to a file with timestamp in filename
+    @Suppress("DEPRECATION")
+    fun saveCorrectedReadingsToFile(): File? {
+        if (correctedReadings.value.isEmpty()) return null
+
+        val timestamp =
+            java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.getDefault()).format(java.util.Date())
+        val filename = "woodrower_readings_$timestamp.json"
+
+        // Save to Download directory so it's accessible to user and other apps
+        val downloadDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+        if (downloadDir == null || !downloadDir.exists()) {
+            // Fallback to app's external files directory
+            val externalDir = context.getExternalFilesDir("readings")
+            if (externalDir != null) {
+                if (!externalDir.exists()) externalDir.mkdirs()
+                val file = File(externalDir, filename)
+                val json = Json { ignoreUnknownKeys = true }
+                val data = correctedReadings.value
+                file.writeText(json.encodeToString(data))
+                file.setReadable(true, false) // Make readable by all users
+                Log.d(TAG, "Saved ${data.size} readings to ${file.absolutePath}")
+                return file
+            }
+            return null
+        }
+
+        if (!downloadDir.exists()) downloadDir.mkdirs()
+        val file = File(downloadDir, filename)
+        val json = Json { ignoreUnknownKeys = true }
+        val data = correctedReadings.value
+        file.writeText(json.encodeToString(data))
+        file.setReadable(true, false) // Make readable by all users
+        Log.d(TAG, "Saved ${data.size} readings to ${file.absolutePath}")
+        return file
+    }
+
+    // Load corrected readings from a file
+    fun loadCorrectedReadingsFromFile(file: File): List<CorrectedReading>? {
+        if (!file.exists()) return null
+        try {
+            val json = Json { ignoreUnknownKeys = true }
+            val content = file.readText()
+            return json.decodeFromString<List<CorrectedReading>>(content)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load readings from ${file.name}: ${e.message}")
+            return null
+        }
+    }
+
+    // List all available reading files
+    @Suppress("DEPRECATION")
+    fun listReadingFiles(): List<File> {
+        val files = mutableListOf<File>()
+
+        // Check Downloads directory first
+        val downloadDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+        downloadDir?.let {
+            if (it.exists()) {
+                files.addAll(it.listFiles()?.filter { f ->
+                    f.name.endsWith(".json") && f.name.startsWith("woodrower_readings_")
+                } ?: emptyList())
+            }
+        }
+
+        // Check app's external files directory
+        val externalDir = context.getExternalFilesDir("readings")
+        externalDir?.let {
+            if (it.exists()) {
+                files.addAll(it.listFiles()?.filter { f ->
+                    f.name.endsWith(".json") && f.name.startsWith("woodrower_readings_")
+                } ?: emptyList())
+            }
+        }
+
+        // Check internal files directory
+        val internalDir = File(context.filesDir, "readings")
+        if (internalDir.exists()) {
+            files.addAll(internalDir.listFiles()?.filter { f ->
+                f.name.endsWith(".json") && f.name.startsWith("woodrower_readings_")
+            } ?: emptyList())
+        }
+
+        return files.sortedBy { it.name }.reversed()
+    }
+
+    // Get average speed for last 10 seconds
+    fun getAverageSpeed10s(): Float {
+        val cutoffTime = System.currentTimeMillis() - 10000  // 10 seconds ago
+        val recentSpeeds = speedReadings.filter { it.first >= cutoffTime && it.second > 0f }
+        return if (recentSpeeds.isNotEmpty()) {
+            recentSpeeds.map { it.second }.average().toFloat()
+        } else {
+            0f
+        }
+    }
+
+    // Get time until next resistance change in seconds
+    fun getTimeUntilNextResistanceChange(): Int {
+        if (resistanceSchedule.isEmpty()) {
+            return -1  // No schedule
+        }
+
+        val currentTime = ((System.currentTimeMillis() - startTime) / 1000).toInt()
+
+        // Find next change, considering loop
+        var nextIndex = lastScheduleIndex
+        if (nextIndex >= resistanceSchedule.size) {
+            nextIndex = 0
+        }
+
+        // Skip past changes
+        while (nextIndex < resistanceSchedule.size &&
+            resistanceSchedule[nextIndex].first <= currentTime
+        ) {
+            nextIndex++
+        }
+
+        if (nextIndex >= resistanceSchedule.size) {
+            nextIndex = 0  // Loop to beginning
+        }
+
+        val nextChange = resistanceSchedule[nextIndex]
+        return maxOf(0, nextChange.first - currentTime)
+    }
+
+    @SuppressLint("MissingPermission")
+    fun startScan() {
+        if (isScanning.value) return
+        isScanning.value = true
+        status.value = "Scanning for $TARGET_NAME..."
+        devices.value = emptyList()
+
+        scanCallback = object : ScanCallback() {
+            override fun onScanResult(type: Int, result: ScanResult) {
+                result.device?.let { d ->
+                    if (d.name?.contains(TARGET_NAME, true) == true &&
+                        !devices.value.any { it.address == d.address }
+                    ) {
+                        devices.value = devices.value + d
+                        status.value = "Found rowing machine: ${d.name}"
+                        connectTo(d)
+                        stopScan()
+                        if (autoScanEnabled) {
+                            isAutoScanning.value = false
+                            autoScanEnabled = false
+                        }
+                    }
+                }
+            }
+
+            override fun onScanFailed(error: Int) {
+                status.value = "Scan failed: $error"
+                stopScan()
+            }
+        }
+
+        adapter?.bluetoothLeScanner?.startScan(
+            null,
+            ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(),
+            scanCallback
+        )
+        // Only auto-stop if not in auto-scan mode
+        if (!autoScanEnabled) {
+            handler.postDelayed({ if (isScanning.value) stopScan() }, 10000)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun stopScan() {
+        adapter?.bluetoothLeScanner?.stopScan(scanCallback)
+        scanCallback = null
+        isScanning.value = false
+    }
+
+    @SuppressLint("MissingPermission")
+    fun startAutoScan() {
+        if (autoScanEnabled) return
+        autoScanEnabled = true
+        isAutoScanning.value = true
+        status.value = "Auto-scanning for rowing machine..."
+        
+        autoScanTimer?.cancel()
+        autoScanTimer = java.util.Timer()
+        
+        autoScanTimer?.scheduleAtFixedRate(object : java.util.TimerTask() {
+            override fun run() {
+                handler.post {
+                    checkAndConnectToRowingMachine()
+                }
+            }
+        }, 0, 5000) // Check every 5 seconds
+    }
+
+    @SuppressLint("MissingPermission")
+    fun stopAutoScan() {
+        autoScanEnabled = false
+        isAutoScanning.value = false
+        autoScanTimer?.cancel()
+        autoScanTimer = null
+        status.value = "Auto-scan stopped"
+    }
+
+    @SuppressLint("MissingPermission")
+    fun checkAndConnectToRowingMachine() {
+        if (!autoScanEnabled || isConnected.value) return
+        
+        // Check if we're already connected
+        if (isConnected.value) {
+            status.value = "Already connected to rowing machine"
+            return
+        }
+        
+        // Check if adapter is available
+        val btAdapter = adapter ?: run {
+            status.value = "Bluetooth adapter not available"
+            return
+        }
+        
+        if (!btAdapter.isEnabled) {
+            status.value = "Bluetooth is disabled"
+            return
+        }
+        
+        // Start a scan to find the rowing machine
+        if (!isScanning.value) {
+            startScan()
+        } else {
+            status.value = "Scan in progress..."
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun connectTo(device: BluetoothDevice) {
+        status.value = "Connecting to ${device.name}..."
+        gatt = device.connectGatt(context, false, callback)
+    }
+
+    @SuppressLint("MissingPermission")
+    fun disconnect() {
+        timer?.cancel()
+        timer = null
+        gatt?.disconnect()
+        gatt?.close()
+        gatt = null
+        isConnected.value = false
+        
+        // If auto-scan was enabled, restart it after disconnection
+        if (autoScanEnabled) {
+            handler.postDelayed({
+                if (autoScanEnabled && !isConnected.value) {
+                    checkAndConnectToRowingMachine()
+                }
+            }, 2000) // Wait 2 seconds before reconnecting
+        }
+        status.value = "Disconnected"
+        deviceStarted = false
+    }
+
+    fun startAutoRefresh(seconds: Int = 1) {
+        stopAutoRefresh()
+        startTime = System.currentTimeMillis()
+        sessionStartTime.value = startTime
+        timer = java.util.Timer()
+        timer?.scheduleAtFixedRate(object : java.util.TimerTask() {
+            override fun run() {
+                readDistance()
+                checkResistanceSchedule()
+                // Add current data to history every second for graph updates
+                data.value?.let { currentData ->
+                    history.value = history.value + currentData
+                }
+                
+                // Check if we haven't received data in the last 2 seconds
+                // If so, try to read again to ensure we have the latest values
+                val currentTime = System.currentTimeMillis()
+                if (currentTime - lastDataUpdateTime > 2000) {
+                    Log.d(TAG, "No recent data update, reading again...")
+                    readDistance()
+                }
+            }
+        }, 0, seconds * 1000L)
+    }
+
+    fun stopAutoRefresh() {
+        timer?.cancel()
+        timer = null
+        startTime = 0
+        sessionStartTime.value = 0
+    }
+
+    // Resistance schedule: list of (timeInSeconds, resistanceLevel) where resistanceLevel is 1-15
+    private val resistanceSchedule = mutableListOf<Pair<Int, Int>>()
+    private var lastScheduleIndex = 0
+
+    fun addResistanceSchedule(timeSeconds: Int, resistanceLevel: Int) {
+        // Clamp resistance to 1-15 range
+        val clampedLevel = resistanceLevel.coerceIn(1, 15)
+        resistanceSchedule.add(Pair(timeSeconds, clampedLevel))
+        resistanceSchedule.sortBy { it.first }
+        lastScheduleIndex = 0
+        resistanceScheduleState.value = resistanceSchedule.toList()
+        Log.d(TAG, "Added resistance schedule: after ${timeSeconds}s set to level ${clampedLevel}")
+    }
+
+    fun clearResistanceSchedule() {
+        resistanceSchedule.clear()
+        lastScheduleIndex = 0
+        resistanceScheduleState.value = emptyList()
+    }
+
+    private fun checkResistanceSchedule() {
+        if (resistanceSchedule.isEmpty() || !isConnected.value) return
+
+        val currentTime = ((System.currentTimeMillis() - startTime) / 1000).toInt()
+
+        // Find the next scheduled change
+        while (lastScheduleIndex < resistanceSchedule.size &&
+            resistanceSchedule[lastScheduleIndex].first <= currentTime
+        ) {
+            val (_, resistance) = resistanceSchedule[lastScheduleIndex]
+            setResistance(resistance)
+            lastScheduleIndex++
+        }
+
+        // Loop: if all changes applied, restart from beginning
+        if (lastScheduleIndex >= resistanceSchedule.size) {
+            lastScheduleIndex = 0
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun setResistance(level: Int) {
+        // Domyos-ROW-0658 uses 1-15 resistance levels
+        val clampedLevel = level.coerceIn(1, 15)
+        val g = gatt ?: return
+
+        for (service in g.services) {
+            val cpChar =
+                service.getCharacteristic(java.util.UUID.fromString(RowingBluetoothUUIDs.CHAR_FITNESS_MACHINE_CONTROL_POINT))
+            if (cpChar != null) {
+                // Use WRITE_TYPE_DEFAULT (with response) for control commands
+                cpChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+
+                // FTMS Control Point requires REQUEST_CONTROL (0x00) first to acquire control
+                // Per CONTEXT.md section 4.5 and server.py implementation
+                if (!deviceStarted) {
+                    // Request Control (0x00)
+                    val requestControlData = byteArrayOf(0x00.toByte())
+                    cpChar.value = requestControlData
+                    val controlSuccess = g.writeCharacteristic(cpChar)
+                    Log.d(TAG, "Sent REQUEST_CONTROL to device (success=$controlSuccess)")
+                    if (!controlSuccess) {
+                        Log.w(TAG, "REQUEST_CONTROL failed, cannot set resistance")
+                        return
+                    }
+                    try {
+                        Thread.sleep(200)  // Increased delay for device processing
+                    } catch (e: InterruptedException) {
+                    }
+
+                    // FTMS devices need to be in "Started" state to accept SET_RESISTANCE
+                    // Send START_OR_RESUME (0x07)
+                    val startData = byteArrayOf(0x07.toByte())  // START_OR_RESUME
+                    cpChar.value = startData
+                    val startSuccess = g.writeCharacteristic(cpChar)
+                    if (!startSuccess) {
+                        Log.w(TAG, "START_OR_RESUME failed, cannot set resistance")
+                        return
+                    }
+                    deviceStarted = true
+                    Log.d(TAG, "Sent START_OR_RESUME to device (success=$startSuccess)")
+                    // Small delay to allow device to process the start command
+                    try {
+                        Thread.sleep(200)  // Increased delay for device processing
+                    } catch (e: InterruptedException) {
+                    }
+                }
+
+                // FTMS Control Point (0x2AD9)
+                // Op Code 0x04 = Set Target Resistance Level
+                // Bytes 1-4: Resistance value as 32-bit float in little-endian (range: 0-100, resolution: 0.1)
+                val resistanceFloat = clampedLevel.toFloat()
+                val data = ByteArray(5)
+                data[0] = 0x04.toByte()  // Op Code: Set Target Resistance Level
+                // Convert resistance to 32-bit float in little-endian
+                ByteBuffer.wrap(data, 1, 4)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .putFloat(resistanceFloat)
+
+                cpChar.value = data
+                
+                // Use WRITE_TYPE_WITH_RESPONSE to ensure we get confirmation
+                cpChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                
+                val success = g.writeCharacteristic(cpChar)
+                lastResistanceChangeTime.value = System.currentTimeMillis()
+                currentResistance.value = clampedLevel
+                Log.i(TAG, "Resistance command sent successfully to level $clampedLevel (float: $resistanceFloat, bytes: ${data.joinToString(", ") { "0x${it.toString(16)}" }}) writeSuccess=$success")
+                
+                // Wait a moment for the device to process the command
+                try {
+                    Thread.sleep(200)
+                } catch (e: InterruptedException) {
+                    // Ignore
+                }
+                return
+            }
+        }
+        Log.w(TAG, "Control Point characteristic not found for resistance")
+    }
+
+    @SuppressLint("MissingPermission")
+    fun increaseResistance() {
+        val current = currentResistance.value
+        if (current < 15) {
+            Log.i(TAG, "Attempting to increase resistance from $current to ${current + 1}")
+            setResistance(current + 1)
+        } else {
+            Log.w(TAG, "Resistance already at maximum (15)")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun decreaseResistance() {
+        val current = currentResistance.value
+        if (current > 1) {
+            Log.i(TAG, "Attempting to decrease resistance from $current to ${current - 1}")
+            setResistance(current - 1)
+        } else {
+            Log.w(TAG, "Resistance already at minimum (1)")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun readDistance() {
+        val g = gatt ?: return
+        Log.d(TAG, "readDistance called")
+
+        // First, try FTMS Rower Data (primary for Domyos-ROW-0658)
+        for (service in g.services) {
+            for (uuid in listOf(
+                RowingBluetoothUUIDs.CHAR_ROWER_DATA,
+                RowingBluetoothUUIDs.CHAR_DOMYOS_CUSTOM,
+                RowingBluetoothUUIDs.CHAR_TREADMILL,
+                RowingBluetoothUUIDs.CHAR_INDOOR_BIKE
+            )) {
+                val c = service.getCharacteristic(java.util.UUID.fromString(uuid))
+                if (c != null) {
+                    Log.d(TAG, "Found characteristic $uuid, props=${c.properties}")
+                    // Check if characteristic supports READ or NOTIFY
+                    if ((c.properties and BluetoothGattCharacteristic.PROPERTY_READ) != 0) {
+                        g.readCharacteristic(c)
+                        Log.d(TAG, "Reading from $uuid")
+                    } else if ((c.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
+                        // Enable notifications for this characteristic
+                        g.setCharacteristicNotification(c, true)
+                        val desc = c.getDescriptor(java.util.UUID.fromString(RowingBluetoothUUIDs.DESC_NOTIFY))
+                        if (desc != null) {
+                            desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                            g.writeDescriptor(desc)
+                        }
+                    }
+                    return
+                }
+            }
+        }
+
+        // If known UUIDs not found, scan all characteristics but skip text-based ones
+        Log.w(TAG, "Known characteristics not found, scanning all...")
+        for (service in g.services) {
+            Log.d(TAG, "Service: ${service.uuid}")
+            for (c in service.characteristics) {
+                Log.d(TAG, "  Characteristic: ${c.uuid}, Props: ${c.properties}")
+                // Skip if it looks like a text/string characteristic (device name, manufacturer, etc.)
+                if (isLikelyTextCharacteristic(c.uuid)) {
+                    Log.d(TAG, "    Skipping (text characteristic): ${c.uuid}")
+                    continue
+                }
+                g.readCharacteristic(c)
+                return // Read one at a time
+            }
+        }
+    }
+
+    private fun isLikelyTextCharacteristic(uuid: java.util.UUID): Boolean {
+        val knownTextUuids = listOf(
+            "00002a00-0000-1000-8000-00805f9b34fb", // Device Name
+            "00002a24-0000-1000-8000-00805f9b34fb", // Model Number
+            "00002a26-0000-1000-8000-00805f9b34fb", // Firmware Revision
+            "00002a28-0000-1000-8000-00805f9b34fb", // Software Revision
+            "00002a29-0000-1000-8000-00805f9b34fb", // Manufacturer Name String
+            "00002a25-0000-1000-8000-00805f9b34fb"  // Serial Number String
+        )
+        return knownTextUuids.contains(uuid.toString().lowercase())
+    }
+
+    // Check if data looks like ASCII text (device name, etc.)
+    private fun isAsciiText(data: ByteArray): Boolean {
+        if (data.isEmpty()) return false
+        return data.all { byte ->
+            (byte in 32..126) || byte == 0x00.toByte() || byte == 0x20.toByte()
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun parseResistanceRange(bytes: ByteArray) {
+        // Parse Supported Resistance Range (0x2AD6)
+        // Per FTMS spec: min, max, increment (all UINT16 in 0.1 units)
+        if (bytes.size >= 6) {
+            val minRaw = java.nio.ByteBuffer.wrap(bytes.copyOfRange(0, 2))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .short.toInt() and 0xFFFF
+            val maxRaw = java.nio.ByteBuffer.wrap(bytes.copyOfRange(2, 4))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .short.toInt() and 0xFFFF
+            val incrementRaw = java.nio.ByteBuffer.wrap(bytes.copyOfRange(4, 6))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .short.toInt() and 0xFFFF
+
+            // Values are in 0.1 units, so divide by 10
+            val min = minRaw / 10
+            val max = maxRaw / 10
+            val increment = incrementRaw / 10
+
+            resistanceMin.value = min
+            resistanceMax.value = max
+
+            Log.d(TAG, "Resistance range: min=$min, max=$max, increment=$increment")
+        } else if (bytes.size >= 3) {
+            // Some devices use 1-byte format
+            val min = bytes[0].toInt() and 0xFF
+            val max = bytes[1].toInt() and 0xFF
+            val increment = bytes[2].toInt() and 0xFF
+
+            resistanceMin.value = min
+            resistanceMax.value = max
+
+            Log.d(TAG, "Resistance range (1-byte): min=$min, max=$max, increment=$increment")
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun parseData(bytes: ByteArray): RowingData? {
+        if (bytes.isEmpty()) return null
+
+        // Helper functions for reading with both endiannesses
+        fun readUInt16Le(offset: Int): UShort {
+            if (offset + 2 > bytes.size) return 0u
+            return ((bytes[offset].toInt() and 0xFF) or ((bytes[offset + 1].toInt() and 0xFF) shl 8)).toUShort()
+        }
+
+        fun readUInt16Be(offset: Int): UShort {
+            if (offset + 2 > bytes.size) return 0u
+            return ((bytes[offset].toInt() and 0xFF) shl 8 or (bytes[offset + 1].toInt() and 0xFF)).toUShort()
+        }
+
+        fun readUInt24Le(offset: Int): Int {
+            if (offset + 3 > bytes.size) return 0
+            return (bytes[offset].toInt() and 0xFF) or
+                    ((bytes[offset + 1].toInt() and 0xFF) shl 8) or
+                    ((bytes[offset + 2].toInt() and 0xFF) shl 16)
+        }
+
+        fun readUInt24Be(offset: Int): Int {
+            if (offset + 3 > bytes.size) return 0
+            return ((bytes[offset].toInt() and 0xFF) shl 16) or
+                    ((bytes[offset + 1].toInt() and 0xFF) shl 8) or
+                    (bytes[offset + 2].toInt() and 0xFF)
+        }
+
+        fun readUInt32Le(offset: Int): UInt {
+            if (offset + 4 > bytes.size) return 0u
+            return ((bytes[offset].toInt() and 0xFF) or
+                    ((bytes[offset + 1].toInt() and 0xFF) shl 8) or
+                    ((bytes[offset + 2].toInt() and 0xFF) shl 16) or
+                    ((bytes[offset + 3].toInt() and 0xFF) shl 24)).toUInt()
+        }
+
+        fun readUInt32Be(offset: Int): UInt {
+            if (offset + 4 > bytes.size) return 0u
+            return (((bytes[offset].toInt() and 0xFF) shl 24) or
+                    ((bytes[offset + 1].toInt() and 0xFF) shl 16) or
+                    ((bytes[offset + 2].toInt() and 0xFF) shl 8) or
+                    (bytes[offset + 3].toInt() and 0xFF)).toUInt()
+        }
+
+        // Log raw data for debugging
+        val hexString = bytes.joinToString(", ") { "%02X".format(it.toInt() and 0xFF) }
+        Log.d(TAG, "Raw data (${bytes.size} bytes): [$hexString]")
+
+        // Detect Domyos-ROW-0658: has flag 0xAE at byte 0
+        val isDomyos = bytes.size >= 1 && bytes[0].toInt() and 0xFF == 0xAE
+        if (isDomyos) {
+            Log.d(TAG, "Detected Domyos-ROW-0658 (flag=0xAE)")
+            // Domyos uses sequential LE fields as per read_logcat_rowing.py
+            return decodeDomyosData(bytes)
+        }
+
+        // Strategy 0: FTMS Rower Data (0x2AD1) - Standard Bluetooth SIG format
+        // Per FTMS spec: https://www.bluetooth.com/specifications/specs/
+        // Rower Data format with 2-byte flags field
+        if (bytes.size >= 2) {
+            // Read 2-byte flags (use BE for Domyos, LE for standard)
+            val flagsLe = ((bytes[0].toInt() and 0xFF) or ((bytes[1].toInt() and 0xFF) shl 8))
+            val flagsBe = ((bytes[0].toInt() and 0xFF) shl 8 or (bytes[1].toInt() and 0xFF))
+            val flags = if (isDomyos) flagsBe else flagsLe
+            Log.d(TAG, "FTMS Flags: 0x%04X (LE=0x%04X, BE=0x%04X)".format(flags, flagsLe, flagsBe))
+
+            var offset = 2  // Start after flags
+            var instantaneousSpeedRaw: UShort = 0u
+            var averageSpeedRaw: UShort = 0u
+            var instantaneousCadenceRaw: UShort = 0u
+            var averageCadenceRaw: UShort = 0u
+            var totalDistanceRaw: Int = 0
+            var totalStrokesRaw: Int = 0
+            var resistanceLevel: Int = 0
+            var elapsedTime: Int = 0
+            var calories: Int = 0
+            var energyTotal: Int = 0
+            var powerWatts: Int = 0
+
+            // FTMS Rower Data field flags (bit positions in 16-bit flags)
+            // Per CONTEXT.md section 4.4:
+            // 0x0001: More Data
+            // 0x0002: Average Speed Present
+            // 0x0004: Instantaneous Cadence Present
+            // 0x0008: Average Cadence Present
+            // 0x0010: Total Distance Present
+            // 0x0020: Instantaneous Power Present
+            // 0x0040: Average Power Present
+            // 0x0080: Resistance Level Present
+            // 0x0100: Total Energy + Energy per Hour + Energy per Minute
+            // 0x0200: Heart Rate Present
+            // 0x0400: Metabolic Equivalent Present
+            // 0x0800: Elapsed Time Present
+            // 0x1000: Remaining Time Present
+            // 0x2000: Total Strokes Present (from FTMS spec)
+            // 0x4000: Average Strokes Present
+
+            // Per FTMS spec for Rower Data:
+            // Instantaneous Speed is ALWAYS present at offset 2-3 (2 bytes, 0.01 m/s units)
+            if (offset == 2 && bytes.size >= 4) {
+                val speedLe = readUInt16Le(2)
+                val speedBe = readUInt16Be(2)
+                // Domyos-ROW-0658 uses BIG ENDIAN for all data fields
+                // For non-Domyos, use BE if LE gives unreasonable value (>10 m/s = 1000 raw)
+                instantaneousSpeedRaw = if (isDomyos) {
+                    speedBe  // Domyos uses BE
+                } else if (speedLe > 1000u) {
+                    speedBe  // LE gives impossible value, use BE
+                } else {
+                    speedLe  // LE is reasonable for standard FTMS
+                }
+                offset = 4
+                Log.d(TAG, "Instantaneous Speed raw LE=$speedLe BE=$speedBe chosen=${instantaneousSpeedRaw} (0.01 m/s) isDomyos=$isDomyos")
+            }
+
+            // Check if Average Speed is present (Bit 1 = 0x0002)
+            if ((flags and 0x0002) != 0 && offset + 2 <= bytes.size) {
+                val speedLe = readUInt16Le(offset)
+                val speedBe = readUInt16Be(offset)
+                averageSpeedRaw = if (isDomyos) {
+                    speedBe
+                } else if (speedLe > 1000u) {
+                    speedBe
+                } else {
+                    speedLe
+                }
+                offset += 2
+                Log.d(TAG, "Average Speed raw LE=$speedLe BE=$speedBe chosen=$averageSpeedRaw (0.01 m/s) isDomyos=$isDomyos")
+            }
+
+            // Check if Instantaneous Cadence is present (Bit 2 = 0x0004)
+            if ((flags and 0x0004) != 0 && offset + 2 <= bytes.size) {
+                val cadenceLe = readUInt16Le(offset)
+                val cadenceBe = readUInt16Be(offset)
+                // Cadence: standard FTMS uses LE (0.5 spm units)
+                // Domyos uses BE for all fields including cadence
+                instantaneousCadenceRaw = if (isDomyos) {
+                    cadenceBe
+                } else if (cadenceLe > 500u) {
+                    cadenceBe
+                } else {
+                    cadenceLe
+                }
+                offset += 2
+                Log.d(TAG, "Instantaneous Cadence raw LE=$cadenceLe BE=$cadenceBe chosen=$instantaneousCadenceRaw (0.5 spm units) isDomyos=$isDomyos")
+            }
+
+            // Check if Average Cadence is present (Bit 3 = 0x0008)
+            if ((flags and 0x0008) != 0 && offset + 2 <= bytes.size) {
+                val cadenceLe = readUInt16Le(offset)
+                val cadenceBe = readUInt16Be(offset)
+                averageCadenceRaw = if (isDomyos) {
+                    cadenceBe
+                } else if (cadenceLe > 500u) {
+                    cadenceBe
+                } else {
+                    cadenceLe
+                }
+                offset += 2
+                Log.d(TAG, "Average Cadence raw LE=$cadenceLe BE=$cadenceBe chosen=$averageCadenceRaw (0.5 spm units) isDomyos=$isDomyos")
+            }
+
+            // Check if Total Distance is present (Bit 4 = 0x0010)
+            if ((flags and 0x0010) != 0 && offset + 3 <= bytes.size) {
+                val distLe = readUInt24Le(offset)
+                val distBe = readUInt24Be(offset)
+                // Distance: 0.1m units
+                totalDistanceRaw = if (isDomyos) {
+                    distBe
+                } else if (distLe > 500000) {
+                    distBe
+                } else {
+                    distLe
+                }
+                offset += 3
+                Log.d(TAG, "Total Distance raw LE=$distLe BE=$distBe chosen=$totalDistanceRaw (0.1m units) isDomyos=$isDomyos")
+            }
+
+            // Standard FTMS: Total Distance is at bytes 10-12 (3 bytes) when flag is present
+            if (totalDistanceRaw == 0 && bytes.size >= 13) {
+                val distLe = readUInt24Le(10)
+                val distBe = readUInt24Be(10)
+                totalDistanceRaw = if (isDomyos) {
+                    distBe
+                } else if (distLe > 500000) {
+                    distBe
+                } else {
+                    distLe
+                }
+                Log.d(TAG, "Distance at bytes 10-12 LE=$distLe BE=$distBe chosen=$totalDistanceRaw (0.1m units) isDomyos=$isDomyos")
+            }
+
+            // Check if Instantaneous Power is present (Bit 5 = 0x0020)
+            if ((flags and 0x0020) != 0 && offset + 2 <= bytes.size) {
+                val powerLe = readUInt16Le(offset).toInt()
+                val powerBe = readUInt16Be(offset).toInt()
+                // Power: watts
+                powerWatts = if (isDomyos) {
+                    powerBe
+                } else if (powerLe > 1000) {
+                    powerBe
+                } else {
+                    powerLe
+                }
+                offset += 2
+                Log.d(TAG, "Instantaneous Power LE=$powerLe BE=$powerBe chosen=$powerWatts watts isDomyos=$isDomyos")
+            }
+
+            // Check if Average Power is present (Bit 6 = 0x0040)
+            if ((flags and 0x0040) != 0 && offset + 2 <= bytes.size) {
+                val avgPowerLe = readUInt16Le(offset)
+                val avgPowerBe = readUInt16Be(offset)
+                val avgPower = if (isDomyos) {
+                    avgPowerBe.toInt()
+                } else if (avgPowerLe > 1000u) {
+                    avgPowerBe.toInt()
+                } else {
+                    avgPowerLe.toInt()
+                }
+                offset += 2
+                Log.d(TAG, "Average Power LE=$avgPowerLe BE=$avgPowerBe chosen=$avgPower watts isDomyos=$isDomyos")
+                // Store average power in powerWatts if instantaneous power not present
+                if (powerWatts == 0 && avgPower > 0) {
+                    powerWatts = avgPower
+                }
+            }
+
+            // Check if Resistance Level is present (Bit 7 = 0x0080)
+            // Resistance Level is 2 bytes (SINT16) for Domyos
+            if ((flags and 0x0080) != 0 && offset + 2 <= bytes.size) {
+                val resistanceLe = ((bytes[offset].toInt() and 0xFF) or ((bytes[offset + 1].toInt() and 0xFF) shl 8))
+                val resistanceBe = ((bytes[offset].toInt() and 0xFF) shl 8 or (bytes[offset + 1].toInt() and 0xFF))
+                resistanceLevel = if (isDomyos) {
+                    resistanceBe.toShort().toInt()  // Domyos uses BE for resistance
+                } else {
+                    resistanceLe.toShort().toInt()  // Standard FTMS uses LE
+                }
+                offset += 2
+                Log.d(TAG, "Resistance Level from data: $resistanceLevel (raw LE=$resistanceLe BE=$resistanceBe)")
+            }
+
+            // Check if Energy per Hour is present (Bit 8 = 0x0100)
+            if ((flags and 0x0100) != 0 && offset + 2 <= bytes.size) {
+                val energyLe = readUInt16Le(offset)
+                val energyBe = readUInt16Be(offset)
+                val energyPerHour = if (isDomyos) {
+                    energyBe.toInt()
+                } else if (energyLe > 5000u) {
+                    energyBe.toInt()
+                } else {
+                    energyLe.toInt()
+                }
+                offset += 2
+                Log.d(TAG, "Energy per Hour LE=$energyLe BE=$energyBe chosen=$energyPerHour isDomyos=$isDomyos")
+            }
+
+            // Check if Energy per Minute is present (Bit 9 = 0x0200)
+            if ((flags and 0x0200) != 0 && offset + 1 <= bytes.size) {
+                val energyPerMin = bytes[offset].toInt() and 0xFF
+                offset += 1
+                Log.d(TAG, "Energy per Minute: $energyPerMin")
+            }
+
+            // Check if Elapsed Time is present (Bit 12 = 0x0800)
+            if ((flags and 0x0800) != 0 && offset + 2 <= bytes.size) {
+                val timeLe = readUInt16Le(offset)
+                val timeBe = readUInt16Be(offset)
+                // Domyos uses BE for time fields
+                elapsedTime = if (isDomyos) {  // Reasonable max: 1 hour = 3600 seconds
+                    timeBe.toInt()
+                } else if (timeLe > 3600u) {
+                    timeBe.toInt()
+                } else {
+                    timeLe.toInt()
+                }
+                offset += 2
+                Log.d(TAG, "Elapsed Time raw LE=$timeLe BE=$timeBe chosen=$elapsedTime (seconds) isDomyos=$isDomyos")
+            }
+
+            // Check if Total Strokes is present (Bit 13 = 0x2000)
+            if ((flags and 0x2000) != 0 && offset + 4 <= bytes.size) {
+                val strokesLe = readUInt32Le(offset)
+                val strokesBe = readUInt32Be(offset)
+                // Total Strokes is UINT32
+                totalStrokesRaw = if (isDomyos) {
+                    strokesBe.toInt()
+                } else if (strokesLe > 999999u) {
+                    strokesBe.toInt()
+                } else {
+                    strokesLe.toInt()
+                }
+                offset += 4
+                Log.d(TAG, "Total Strokes raw LE=$strokesLe BE=$strokesBe chosen=$totalStrokesRaw isDomyos=$isDomyos")
+            }
+
+            // Calculate speed in m/s (0.01 m/s units to m/s)
+            val speedMs = if (instantaneousSpeedRaw.toInt() != 0) {
+                instantaneousSpeedRaw.toFloat() / 100f
+            } else {
+                0f
+            }
+
+            // Calculate distance in meters (0.1m units to meters)
+            val distanceMeters = if (totalDistanceRaw != 0) {
+                totalDistanceRaw.toFloat() / 10f
+            } else {
+                0f
+            }
+
+            // Calculate cadence in strokes per minute (0.5 spm units)
+            // Use instantaneous cadence if available, otherwise average cadence, otherwise 0
+            val cadenceSpm = if (instantaneousCadenceRaw.toInt() != 0) {
+                instantaneousCadenceRaw.toFloat() / 2f  // 0.5 spm units to spm
+            } else if (averageCadenceRaw.toInt() != 0) {
+                averageCadenceRaw.toFloat() / 2f
+            } else {
+                0f
+            }
+
+            // Calculate average cadence in strokes per minute (0.5 spm units)
+            val averageCadenceSpm = if (averageCadenceRaw.toInt() != 0) {
+                averageCadenceRaw.toFloat() / 2f
+            } else {
+                cadenceSpm  // Use instantaneous if average not available
+            }
+
+            // For now, total strokes is estimated from cadence and time if we have cadence data
+            // Alternatively, some devices send Total Strokes directly
+            // We'll set it to 0 for now and can update if we find the data
+            val totalStrokesCount = totalStrokesRaw
+
+            // Calculate calories from distance (estimate for rowing: ~0.12 cal/meter)
+            calories = (distanceMeters * 0.12f).toInt()
+
+            // For resistance level, clamp to 1-15 range as Domyos uses 1-15
+            // If resistance is negative or zero, it might not be supported by this device
+            if (resistanceLevel < 0) {
+                resistanceLevel = 0
+            } else if (resistanceLevel > 15) {
+                resistanceLevel = 15
+            }
+
+            // Track speeds with timestamps for 10s average calculation
+            val currentTimestamp = System.currentTimeMillis()
+            if (speedMs > 0f) {
+                speedReadings.add(Pair(currentTimestamp, speedMs))
+                // Remove readings older than 60 seconds to prevent memory growth
+                val cutoff = currentTimestamp - 60000
+                speedReadings.removeIf { it.first < cutoff }
+            }
+
+            // Calculate average speed for last 10 seconds
+            val averageSpeed10s = getAverageSpeed10s()
+
+            // Calculate average speed from all readings (session average)
+            val averageSpeed = if (speedReadings.isNotEmpty()) {
+                speedReadings.map { it.second }.average().toFloat()
+            } else {
+                0f
+            }
+
+            // Update current resistance if it changed
+            if (resistanceLevel != currentResistance.value) {
+                currentResistance.value = resistanceLevel
+                Log.d(TAG, "Resistance updated to: $resistanceLevel")
+            }
+
+            // Use elapsed time from device if available, otherwise calculate from startTime
+            val finalElapsedTime = if (elapsedTime > 0) {
+                elapsedTime
+            } else {
+                ((System.currentTimeMillis() - startTime) / 1000).toInt()
+            }
+
+            Log.d(
+                TAG,
+                "FTMS Rower Data parsed: speed=${speedMs}m/s, avgSpeed10s=${averageSpeed10s}m/s, avgSpeed=${averageSpeed}m/s, distance=${distanceMeters}m, cadence=${cadenceSpm} spm, strokes=$totalStrokesCount, resistance=$resistanceLevel, time=${finalElapsedTime}s"
+            )
+
+            if (distanceMeters in 0f..50000f) {
+                return RowingData(
+                    totalDistance = distanceMeters,
+                    speed = speedMs,
+                    averageSpeed = averageSpeed10s,  // Use 10s average for display
+                    calories = calories,
+                    time = finalElapsedTime,
+                    resistanceLevel = resistanceLevel,
+                    cadence = cadenceSpm,
+                    averageCadence = averageCadenceSpm,
+                    power = powerWatts,
+                    totalStrokes = totalStrokesCount
+                )
+            }
+        }
+
+        // Fallback: Try to parse as FTMS Rower Data with fixed offsets (original approach)
+        if (bytes.size >= 18) {
+            // Parse speed (bytes 1-2, LITTLE_ENDIAN)
+            val instantaneousSpeedRaw = ((bytes[1].toInt() and 0xFF) or ((bytes[2].toInt() and 0xFF) shl 8)).toUShort()
+            val speedMs = instantaneousSpeedRaw.toFloat() / 100f  // 0.01 m/s to m/s
+
+            // Parse total distance (bytes 15-17)
+            val totalDistanceRaw = (bytes[15].toInt() and 0xFF) or
+                    ((bytes[16].toInt() and 0xFF) shl 8) or
+                    ((bytes[17].toInt() and 0xFF) shl 16)
+            val distanceMeters = totalDistanceRaw.toFloat() / 10f  // 0.1m to meters
+
+            // Parse flags (byte 0)
+            val flags = bytes[0].toInt() and 0xFF
+
+            // Parse resistance level if present (flag 0x0080, bytes 18-19)
+            var resistanceLevel = 0
+            if ((flags and 0x0080) != 0 && bytes.size >= 20) {
+                resistanceLevel = java.nio.ByteBuffer.wrap(bytes.copyOfRange(18, 20))
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                    .short.toInt()
+                Log.d(TAG, "Resistance level from data (fallback): $resistanceLevel")
+            }
+
+            Log.d(
+                TAG,
+                "FTMS Rower Data (fallback): speed=${speedMs}m/s, distance raw=$totalDistanceRaw = ${distanceMeters}m, resistance=$resistanceLevel"
+            )
+            if (distanceMeters in 0f..50000f) {
+                val elapsedSeconds = ((System.currentTimeMillis() - startTime) / 1000).toInt()
+                // Calculate calories: ~0.12 cal/meter for average rower
+                val calories = (distanceMeters * 0.12f).toInt()
+
+                // Track speeds with timestamps for 10s average calculation
+                val currentTimestamp = System.currentTimeMillis()
+                if (speedMs > 0f) {
+                    speedReadings.add(Pair(currentTimestamp, speedMs))
+                    // Remove readings older than 60 seconds to prevent memory growth
+                    val cutoff = currentTimestamp - 60000
+                    speedReadings.removeIf { it.first < cutoff }
+                }
+
+                // Calculate average speed for last 10 seconds
+                val averageSpeed10s = getAverageSpeed10s()
+
+                // Update current resistance if it changed
+                if (resistanceLevel != currentResistance.value) {
+                    currentResistance.value = resistanceLevel
+                }
+
+                return RowingData(
+                    totalDistance = distanceMeters,
+                    speed = speedMs,
+                    averageSpeed = averageSpeed10s,
+                    calories = calories,
+                    time = elapsedSeconds,
+                    resistanceLevel = resistanceLevel,
+                    cadence = 0f,
+                    averageCadence = 0f,
+                    power = 0,
+                    totalStrokes = 0
+                )
+            }
+        }
+
+        // Try different parsing strategies for Domyos-ROW-0658
+        // Strategy 1: UInt32 in centimeters (most common for Domyos)
+        if (bytes.size >= 4) {
+            val uint32Cm = java.nio.ByteBuffer.wrap(bytes.copyOfRange(0, 4))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .int.toLong() and 0xFFFFFFFFL
+            val distanceMeters = uint32Cm.toFloat() / 100f  // cm to meters
+            Log.d(TAG, "UInt32 LE cm: $uint32Cm cm = ${distanceMeters}m")
+
+            // If distance is reasonable (0-50000m), use it
+            if (distanceMeters in 0f..50000f) {
+                return RowingData(totalDistance = distanceMeters)
+            }
+        }
+
+        // Strategy 2: Try UInt32 in meters * 10 (0.1m units)
+        if (bytes.size >= 4) {
+            val uint32Deci = java.nio.ByteBuffer.wrap(bytes.copyOfRange(0, 4))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .int.toLong() and 0xFFFFFFFFL
+            val distanceMeters = uint32Deci.toFloat() / 10f
+            Log.d(TAG, "UInt32 LE 0.1m: $uint32Deci = ${distanceMeters}m")
+
+            if (distanceMeters in 0f..50000f) {
+                return RowingData(totalDistance = distanceMeters)
+            }
+        }
+
+        // Strategy 3: Try UInt32 in meters (direct)
+        if (bytes.size >= 4) {
+            val uint32M = java.nio.ByteBuffer.wrap(bytes.copyOfRange(0, 4))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .int.toLong() and 0xFFFFFFFFL
+            val distanceMeters = uint32M.toFloat()
+            Log.d(TAG, "UInt32 LE m: $uint32M = ${distanceMeters}m")
+
+            if (distanceMeters in 0f..50000f) {
+                return RowingData(totalDistance = distanceMeters)
+            }
+        }
+
+        // Strategy 4: Try BIG_ENDIAN versions
+        if (bytes.size >= 4) {
+            val uint32BeCm = java.nio.ByteBuffer.wrap(bytes.copyOfRange(0, 4))
+                .order(java.nio.ByteOrder.BIG_ENDIAN)
+                .int.toLong() and 0xFFFFFFFFL
+            val distanceMeters = uint32BeCm.toFloat() / 100f
+            Log.d(TAG, "UInt32 BE cm: $uint32BeCm cm = ${distanceMeters}m")
+
+            if (distanceMeters in 0f..50000f) {
+                return RowingData(totalDistance = distanceMeters)
+            }
+        }
+
+        // Strategy 5: Try float (original)
+        if (bytes.size >= 4) {
+            val floatVal = java.nio.ByteBuffer.wrap(bytes.copyOfRange(0, 4))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .float
+            Log.d(TAG, "Float LE: $floatVal m")
+
+            if (floatVal in 0f..50000f) {
+                return RowingData(totalDistance = floatVal)
+            }
+        }
+
+        // Strategy for Domyos-ROW-0658: Fixed format without flags
+        // Based on common Domyos rower data format
+        // Bytes 0-1: Instantaneous Speed (0.01 m/s units, LE)
+        // Bytes 2-3: Average Speed (0.01 m/s units, LE)
+        // Bytes 4-6: Total Distance (0.1m units, LE)
+        // Byte 7: Resistance Level
+        // Bytes 8-9: Elapsed Time (seconds, LE)
+        // Bytes 10-11: Energy/Calories (kCal, LE)
+        if (bytes.size >= 12) {
+            val speedRaw = java.nio.ByteBuffer.wrap(bytes.copyOfRange(0, 2))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .short.toInt() and 0xFFFF
+            val speedMs = speedRaw.toFloat() / 100f
+
+            val avgSpeedRaw = java.nio.ByteBuffer.wrap(bytes.copyOfRange(2, 4))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .short.toInt() and 0xFFFF
+            val avgSpeedMs = avgSpeedRaw.toFloat() / 100f
+
+            val distanceRaw = java.nio.ByteBuffer.wrap(bytes.copyOfRange(4, 7))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .int.toLong() and 0xFFFFFFL
+            val distanceMeters = distanceRaw.toFloat() / 10f
+
+            val resistanceLevel = bytes[7].toInt() and 0xFF
+
+            val elapsedTime = java.nio.ByteBuffer.wrap(bytes.copyOfRange(8, 10))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .short.toInt() and 0xFFFF
+
+            val calories = java.nio.ByteBuffer.wrap(bytes.copyOfRange(10, 12))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .short.toInt() and 0xFFFF
+
+            Log.d(
+                TAG,
+                "Domyos format: speed=${speedMs}m/s, avg=${avgSpeedMs}m/s, distance=${distanceMeters}m, resistance=$resistanceLevel, time=${elapsedTime}s, calories=$calories"
+            )
+
+            if (distanceMeters in 0f..50000f) {
+                // Track speeds with timestamps for 10s average calculation
+                val currentTimestamp = System.currentTimeMillis()
+                if (speedMs > 0f) {
+                    speedReadings.add(Pair(currentTimestamp, speedMs))
+                    // Remove readings older than 60 seconds to prevent memory growth
+                    val cutoff = currentTimestamp - 60000
+                    speedReadings.removeIf { it.first < cutoff }
+                }
+
+                // Calculate average speed for last 10 seconds
+                val averageSpeed10s = getAverageSpeed10s()
+
+                // Update current resistance if it changed
+                if (resistanceLevel != currentResistance.value) {
+                    currentResistance.value = resistanceLevel
+                }
+
+                return RowingData(
+                    totalDistance = distanceMeters,
+                    speed = speedMs,
+                    averageSpeed = averageSpeed10s,
+                    calories = calories,
+                    time = elapsedTime,
+                    resistanceLevel = resistanceLevel,
+                    cadence = 0f,
+                    averageCadence = 0f,
+                    power = 0,
+                    totalStrokes = 0
+                )
+            }
+        }
+
+        // Strategy 6: Try 2-byte UInt16 in meters
+        if (bytes.size >= 2) {
+            val uint16 = java.nio.ByteBuffer.wrap(bytes.copyOfRange(0, 2))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .short.toInt() and 0xFFFF
+            val distanceMeters = uint16.toFloat()
+            Log.d(TAG, "UInt16 LE: $uint16 = ${distanceMeters}m")
+
+            if (distanceMeters in 0f..50000f) {
+                return RowingData(totalDistance = distanceMeters)
+            }
+        }
+
+        // Strategy 7: Try 2-byte UInt16 in cm
+        if (bytes.size >= 2) {
+            val uint16 = java.nio.ByteBuffer.wrap(bytes.copyOfRange(0, 2))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .short.toInt() and 0xFFFF
+            val distanceMeters = uint16.toFloat() / 100f
+            Log.d(TAG, "UInt16 LE cm: $uint16 cm = ${distanceMeters}m")
+
+            if (distanceMeters in 0f..50000f) {
+                return RowingData(totalDistance = distanceMeters)
+            }
+        }
+
+        // Try all offsets (some devices have headers)
+        for (offset in 1..minOf(4, bytes.size - 4)) {
+            val slice = bytes.copyOfRange(offset, offset + 4)
+            val uint32Cm = java.nio.ByteBuffer.wrap(slice)
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .int.toLong() and 0xFFFFFFFFL
+            val distanceMeters = uint32Cm.toFloat() / 100f
+            Log.d(TAG, "UInt32 LE cm @+$offset: $uint32Cm cm = ${distanceMeters}m")
+
+            if (distanceMeters in 0f..50000f) {
+                return RowingData(totalDistance = distanceMeters)
+            }
+        }
+
+        Log.w(TAG, "Could not parse data: $hexString")
+        return null
+    }
+
+    private val callback = object : BluetoothGattCallback() {
+        @SuppressLint("MissingPermission")
+        override fun onConnectionStateChange(g: BluetoothGatt, s: Int, n: Int) {
+            if (n == BluetoothProfile.STATE_CONNECTED) {
+                status.value = "Discovering services..."
+                g.discoverServices()
+            } else if (n == BluetoothProfile.STATE_DISCONNECTED) {
+                isConnected.value = false
+                status.value = "Disconnected"
+                g.close()
+                if (this@RowingBluetoothManager.gatt == g) this@RowingBluetoothManager.gatt = null
+            }
+        }
+
+        override fun onServicesDiscovered(g: BluetoothGatt, s: Int) {
+            if (s == BluetoothGatt.GATT_SUCCESS) {
+                isConnected.value = true
+                status.value = "Connected"
+                Log.d(TAG, "=== Discovered Services ===")
+                for (service in g.services) {
+                    Log.d(TAG, "Service: ${service.uuid}")
+                    for (characteristic in service.characteristics) {
+                        Log.d(TAG, "  Char: ${characteristic.uuid} | Props: ${characteristic.properties}")
+                    }
+                }
+                Log.d(TAG, "==========================")
+
+
+                // Enable notifications on all data characteristics
+                for (service in g.services) {
+                    for (uuid in listOf(
+                        RowingBluetoothUUIDs.CHAR_ROWER_DATA,
+                        RowingBluetoothUUIDs.CHAR_DOMYOS_CUSTOM,
+                        RowingBluetoothUUIDs.CHAR_TREADMILL,
+                        RowingBluetoothUUIDs.CHAR_INDOOR_BIKE
+                    )) {
+                        val c = service.getCharacteristic(java.util.UUID.fromString(uuid))
+                        if (c != null) {
+                            // Enable notifications
+                            g.setCharacteristicNotification(c, true)
+                            val desc = c.getDescriptor(java.util.UUID.fromString(RowingBluetoothUUIDs.DESC_NOTIFY))
+                            if (desc != null) {
+                                desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                                g.writeDescriptor(desc)
+                                Log.d(TAG, "Enabled notifications for ${c.uuid}")
+                            }
+                        }
+                    }
+                    // Enable indications on Control Point to receive FTMS command responses
+                    val cpChar =
+                        service.getCharacteristic(java.util.UUID.fromString(RowingBluetoothUUIDs.CHAR_FITNESS_MACHINE_CONTROL_POINT))
+                    if (cpChar != null) {
+                        g.setCharacteristicNotification(cpChar, true)
+                        val desc = cpChar.getDescriptor(java.util.UUID.fromString(RowingBluetoothUUIDs.DESC_NOTIFY))
+                        if (desc != null) {
+                            desc.value = BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                            g.writeDescriptor(desc)
+                            Log.d(TAG, "Enabled indications for Control Point ${cpChar.uuid}")
+                        }
+                    }
+                    // Read Supported Resistance Range to get actual min/max from device
+                    val rangeChar =
+                        service.getCharacteristic(java.util.UUID.fromString(RowingBluetoothUUIDs.CHAR_SUPPORTED_RESISTANCE_RANGE))
+                    if (rangeChar != null) {
+                        g.readCharacteristic(rangeChar)
+                        Log.d(TAG, "Reading Supported Resistance Range")
+                    }
+                }
+
+                // Reset all values to zero on new connection
+                resetSession()
+
+                startAutoRefresh(1)
+            } else {
+                status.value = "Service discovery failed"
+            }
+        }
+
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, s: Int) {
+            if (s == BluetoothGatt.GATT_SUCCESS) {
+                val uuid = c.uuid.toString()
+                val hex = c.value.joinToString("") { "%02X".format(it.toInt() and 0xFF) }
+                Log.d(TAG, "onCharacteristicRead for ${uuid}: $hex")
+
+                // Handle Supported Resistance Range (0x2AD6)
+                if (uuid == RowingBluetoothUUIDs.CHAR_SUPPORTED_RESISTANCE_RANGE) {
+                    parseResistanceRange(c.value)
+                    // Try next characteristic
+                    readDistance()
+                    return
+                }
+
+                // Skip if this is ASCII text (device name, etc.)
+                if (isAsciiText(c.value)) {
+                    Log.d(TAG, "Skipping ASCII text from ${c.uuid}: ${String(c.value)}")
+                    // Try next characteristic
+                    readDistance()
+                    return
+                }
+
+                parseData(c.value)?.let { d ->
+                    data.value = d
+                    lastDataUpdateTime = System.currentTimeMillis()
+                    history.value = history.value + d
+                    status.value = "Distance: ${"%.1f".format(d.totalDistance)}m"
+                } ?: run {
+                    // Parsing failed, show raw data for debugging
+                    status.value = "Raw: $hex"
+                    Log.w(TAG, "Failed to parse characteristic ${c.uuid}: $hex")
+                    // Try next characteristic
+                    readDistance()
+                }
+                @Suppress("DEPRECATION")
+                if ((c.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
+                    g.setCharacteristicNotification(c, true)
+                    c.getDescriptor(java.util.UUID.fromString(RowingBluetoothUUIDs.DESC_NOTIFY))?.let { desc ->
+                        desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        g.writeDescriptor(desc)
+                    }
+                }
+            }
+        }
+
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
+            val hex = c.value.joinToString("") { "%02X".format(it.toInt() and 0xFF) }
+            Log.d(TAG, "onCharacteristicChanged for ${c.uuid}: $hex")
+
+            // Handle Control Point indications (FTMS command responses)
+            if (c.uuid == java.util.UUID.fromString(RowingBluetoothUUIDs.CHAR_FITNESS_MACHINE_CONTROL_POINT)) {
+                // FTMS Control Point response format: [0x80, opcode, result_code]
+                // See Bluetooth SIG FTMS spec
+                if (c.value.size >= 3 && (c.value[0].toInt() and 0xFF) == 0x80) {
+                    val opcode = c.value[1].toInt() and 0xFF
+                    val resultCode = c.value[2].toInt() and 0xFF
+                    when (opcode) {
+                        0x00 -> Log.d(
+                            TAG,
+                            "REQUEST_CONTROL response: ${if (resultCode == 0x01) "Success" else "Error $resultCode"}"
+                        )
+
+                        0x04 -> Log.d(
+                            TAG,
+                            "SET_RESISTANCE response: ${if (resultCode == 0x01) "Success" else "Error $resultCode"}"
+                        )
+
+                        0x07 -> Log.d(
+                            TAG,
+                            "START_OR_RESUME response: ${if (resultCode == 0x01) "Success" else "Error $resultCode"}"
+                        )
+
+                        else -> Log.d(
+                            TAG,
+                            "Unknown Control Point response: opcode=0x${opcode.toString(16)}, result=0x${
+                                resultCode.toString(16)
+                            }"
+                        )
+                    }
+                }
+                return
+            }
+
+            // Handle data characteristics
+            parseData(c.value)?.let { d ->
+                // Always update with the latest data from the rower
+                data.value = d
+                lastDataUpdateTime = System.currentTimeMillis()
+                history.value = history.value + d
+                Log.d(
+                    TAG,
+                    "Updated data: distance=${d.totalDistance}m, speed=${d.speed}m/s, cadence=${d.cadence} spm, avgCadence=${d.averageCadence} spm, calories=${d.calories}, time=${d.time}s, resistance=${d.resistanceLevel}, strokes=${d.totalStrokes}"
+                )
+            } ?: run {
+                Log.w(
+                    TAG,
+                    "Failed to parse data from ${c.uuid}: ${c.value.joinToString(", ") { "%02X".format(it.toInt() and 0xFF) }}"
+                )
+            }
+        }
+    }
+
+    /**
+     * Decode Domyos rower data using Little Endian for all data fields
+     * Based on user requirements and the read_logcat_rowing.py analysis
+     */
+    private fun decodeDomyosData(bytes: ByteArray): RowingData? {
+        if (bytes.size < 22) {
+            Log.w(TAG, "Domyos data too short: ${bytes.size} bytes")
+            return null
+        }
+
+        // Log raw data for debugging
+        val hexString = bytes.joinToString(", ") { "%02X".format(it.toInt() and 0xFF) }
+        Log.d(TAG, "Domyos raw data (${bytes.size} bytes): [$hexString]")
+
+        // Read flags byte (1 byte at position 0)
+        val flagsByte = bytes[0].toInt() and 0xFF
+        Log.d(TAG, "Domyos flags: 0x%02X".format(flagsByte))
+
+        // Based on user specification and debug_resistance.py:
+        // Byte 0: flags (1 byte) - value 0xAE for Domyos, bit 7 indicates resistance present
+        // Bytes 1-2: Instantaneous Cadence (LE, 0.5 spm units)
+        // Bytes 3-4: Average Cadence (LE, 0.5 spm units)
+        // Bytes 5-6: Instantaneous Power (LE, 0.01 watts)
+        // Bytes 7-8: Average Power (LE, 0.01 watts)
+        // Byte 9: Elapsed Time (1 byte, seconds)
+        // Bytes 10-11: Resistance Level (SINT16, LE) - if bit 7 is set
+        // Bytes 12-14: Total Distance (LE, 0.1m units)
+        // Bytes 15-18: Total Strokes (LE, UINT32)
+        // Bytes 20-21: Instantaneous Speed (LE, 0.01 m/s units) - Note: starts at byte 20, not 19
+        try {
+            // Read all fields as Little-Endian
+            val instantaneousCadenceRaw = (bytes[1].toInt() and 0xFF) or ((bytes[2].toInt() and 0xFF) shl 8)
+            val averageCadenceRaw = (bytes[3].toInt() and 0xFF) or ((bytes[4].toInt() and 0xFF) shl 8)
+            val instantaneousPowerRaw = (bytes[5].toInt() and 0xFF) or ((bytes[6].toInt() and 0xFF) shl 8)
+            val averagePowerRaw = (bytes[7].toInt() and 0xFF) or ((bytes[8].toInt() and 0xFF) shl 8)
+            val elapsedTimeRaw = bytes[9].toInt() and 0xFF
+            
+            // Resistance Level (2 bytes, SINT16) at bytes 10-11 - only valid if bit 7 is set
+            val resistanceLevel = if ((flagsByte and 0x80) != 0 && bytes.size >= 12) {
+                val resistanceRaw = (bytes[10].toInt() and 0xFF) or ((bytes[11].toInt() and 0xFF) shl 8)
+                resistanceRaw.toShort().toInt()  // SINT16
+            } else {
+                0
+            }
+            
+            val totalDistanceRaw = (bytes[12].toInt() and 0xFF) or
+                    ((bytes[13].toInt() and 0xFF) shl 8) or
+                    ((bytes[14].toInt() and 0xFF) shl 16)
+            val totalStrokesRaw = (bytes[15].toInt() and 0xFF) or
+                    ((bytes[16].toInt() and 0xFF) shl 8) or
+                    ((bytes[17].toInt() and 0xFF) shl 16) or
+                    ((bytes[18].toInt() and 0xFF) shl 24)
+            // Note: Byte 19 appears to be padding or unused in test data
+            val instantaneousSpeedRaw = (bytes[20].toInt() and 0xFF) or ((bytes[21].toInt() and 0xFF) shl 8)
+
+            // Log parsed values
+            Log.d(TAG, "Domyos decoded: flags=0x%02X".format(flagsByte) + 
+                    ", speed=${instantaneousSpeedRaw} (0.01 m/s), " +
+                    "cadence=${instantaneousCadenceRaw} (0.5 spm), " +
+                    "avgCadence=${averageCadenceRaw} (0.5 spm), " +
+                    "power=${instantaneousPowerRaw} (0.01W), " +
+                    "avgPower=${averagePowerRaw} (0.01W), " +
+                    "distance=${totalDistanceRaw} (0.1m), " +
+                    "resistance=${resistanceLevel}, " +
+                    "strokes=${totalStrokesRaw}, " +
+                    "time=${elapsedTimeRaw} (s)")
+
+            // Convert to proper units
+            val speedMs = instantaneousSpeedRaw.toFloat() / 100f
+            val averageSpeedMs = 0f  // Avg speed not present in this format
+            val cadenceSpm = instantaneousCadenceRaw.toFloat() / 2f
+            val averageCadenceSpm = averageCadenceRaw.toFloat() / 2f
+            val distanceMeters = totalDistanceRaw.toFloat() / 10f
+            val elapsedTime = elapsedTimeRaw
+            val powerWatts = (instantaneousPowerRaw.toFloat() / 100f).toInt()
+            val averagePowerWatts = (averagePowerRaw.toFloat() / 100f).toInt()
+
+            // Clamp resistance to valid range (1-15)
+            val clampedResistance = when {
+                resistanceLevel < 1 -> 1
+                resistanceLevel > 15 -> 15
+                else -> resistanceLevel
+            }
+
+            // Update current resistance state
+            if (clampedResistance != currentResistance.value) {
+                currentResistance.value = clampedResistance
+                Log.d(TAG, "Domyos resistance updated to: $clampedResistance")
+            }
+
+            // Calculate calories from distance
+            val calories = (distanceMeters * 0.12f).toInt()
+
+            return RowingData(
+                totalDistance = distanceMeters,
+                speed = speedMs,
+                averageSpeed = averageSpeedMs,
+                calories = calories,
+                time = elapsedTime,
+                resistanceLevel = clampedResistance,
+                cadence = cadenceSpm,
+                averageCadence = averageCadenceSpm,
+                power = powerWatts,
+                totalStrokes = totalStrokesRaw
+            )
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error decoding Domyos data: ${e.message}")
+            e.printStackTrace()
+            return null
+        }
+    }}
