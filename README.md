@@ -6,4 +6,8 @@ Created with mistral vibe, drawing heavily from ressources found in other github
 Created for my own private use, but feel free to use it at will.
 
 Installation
-Has to be compiled using the gradlew script which is part of google's AndroidStudio. Sent the created apk to the Android device using adb.
+Install gradle
+Run 
+gradle wrapper
+./gradlew assemble
+Sent the created apk to the Android device using adb.
